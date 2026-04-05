@@ -14,14 +14,11 @@ from discord import app_commands
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 
 if not TOKEN:
     raise ValueError("A variável DISCORD_BOT_TOKEN não foi encontrada.")
 
-# Nomes dos emojis que precisam existir em cada servidor
-# iguais aos que tu mostrou no print:
-# menos13 / mais13 / mais18 / mais21
 AGE_EMOJI_NAMES = ["menos13", "mais13", "mais18", "mais21"]
 
 DEFAULT_WELCOME_MESSAGE = (
@@ -43,7 +40,13 @@ STATUS_LIST = [
 # DATABASE
 # =========================================================
 
+def ensure_db_dir():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
 def get_conn():
+    ensure_db_dir()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -223,13 +226,11 @@ class Consumed(commands.Bot):
         intents.members = True
         intents.message_content = True
 
-        super().__init__(
-            command_prefix="!",
-            intents=intents
-        )
+        super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
         init_db()
+        self.add_view(AgeView())
 
 bot = Consumed()
 
@@ -254,24 +255,8 @@ async def change_status():
 # =========================================================
 
 class AgeView(discord.ui.View):
-    def __init__(self, guild: Optional[discord.Guild] = None):
+    def __init__(self):
         super().__init__(timeout=None)
-
-        # Se tiver guild, tenta botar os emojis custom nos botões
-        if guild is not None:
-            btn_menos13 = self.get_item("age_menos13")
-            btn_mais13 = self.get_item("age_mais13")
-            btn_mais18 = self.get_item("age_mais18")
-            btn_mais21 = self.get_item("age_mais21")
-
-            if btn_menos13:
-                btn_menos13.emoji = get_emoji_by_name(guild, "menos13")
-            if btn_mais13:
-                btn_mais13.emoji = get_emoji_by_name(guild, "mais13")
-            if btn_mais18:
-                btn_mais18.emoji = get_emoji_by_name(guild, "mais18")
-            if btn_mais21:
-                btn_mais21.emoji = get_emoji_by_name(guild, "mais21")
 
     async def handle_role(self, interaction: discord.Interaction, age_key: str):
         guild = interaction.guild
@@ -303,13 +288,11 @@ class AgeView(discord.ui.View):
             return
 
         try:
-            # remove cargos de idade anteriores
             for role_id in age_roles.values():
                 role = guild.get_role(role_id)
                 if role and role in member.roles:
                     await member.remove_roles(role)
 
-            # adiciona o novo
             await member.add_roles(target_role)
 
             label_map = {
@@ -371,6 +354,26 @@ class AgeView(discord.ui.View):
     async def mais21(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_role(interaction, "mais21")
 
+def build_age_view_for_guild(guild: discord.Guild) -> AgeView:
+    view = AgeView()
+
+    emoji_map = {
+        "age_menos13": "menos13",
+        "age_mais13": "mais13",
+        "age_mais18": "mais18",
+        "age_mais21": "mais21",
+    }
+
+    for item in view.children:
+        if isinstance(item, discord.ui.Button):
+            emoji_name = emoji_map.get(item.custom_id)
+            if emoji_name:
+                emoji = get_emoji_by_name(guild, emoji_name)
+                if emoji:
+                    item.emoji = emoji
+
+    return view
+
 # =========================================================
 # EVENTOS
 # =========================================================
@@ -382,9 +385,6 @@ async def on_ready():
         print(f"Slash commands sincronizados: {len(synced)}")
     except Exception as e:
         print(f"Erro ao sincronizar slash commands: {e}")
-
-    # persistent view pros botões continuarem funcionando após restart
-    bot.add_view(AgeView())
 
     if not change_status.is_running():
         change_status.start()
@@ -400,7 +400,6 @@ async def on_member_join(member: discord.Member):
     welcome_message = cfg.get("welcome_message") or DEFAULT_WELCOME_MESSAGE
     welcome_gif = cfg.get("welcome_gif")
 
-    # cargo automático
     if member_role_id:
         role = member.guild.get_role(member_role_id)
         if role:
@@ -409,7 +408,6 @@ async def on_member_join(member: discord.Member):
             except Exception as e:
                 print(f"Erro ao dar cargo automático em {member.guild.name}: {e}")
 
-    # canal de boas-vindas
     channel = await get_text_channel(member.guild, welcome_channel_id)
     if not channel:
         return
@@ -421,10 +419,8 @@ async def on_member_join(member: discord.Member):
         color=discord.Color.from_rgb(0, 0, 0)
     )
 
-    # foto da pessoa
     embed.set_thumbnail(url=member.display_avatar.url)
 
-    # gif embaixo
     if welcome_gif:
         embed.set_image(url=welcome_gif)
 
@@ -599,7 +595,7 @@ async def postar_idade(interaction: discord.Interaction):
         return
 
     embed = build_age_embed(interaction.guild)
-    view = AgeView(interaction.guild)
+    view = build_age_view_for_guild(interaction.guild)
 
     msg = await channel.send(embed=embed, view=view)
     set_guild_config(interaction.guild.id, age_message_id=msg.id)
