@@ -480,17 +480,19 @@ async def on_member_join(member: discord.Member):
     embed.set_footer(text=member.guild.name)
 
     try:
-        await asyncio.sleep(1.2)
-        await channel.send(embed=embed)
+    await asyncio.sleep(1.2)
+    await channel.send(embed=embed)
 
-        # manda o gif separado pra animar de verdade
-        if welcome_gif and is_valid_image_url(welcome_gif):
-            await channel.send(welcome_gif)
-        elif welcome_gif:
-            print(f"GIF inválido ignorado em {member.guild.name}: {welcome_gif}")
+    # manda o gif separado pra animar de verdade
+    if welcome_gif and is_valid_image_url(welcome_gif):
+        gif_embed = discord.Embed()
+        gif_embed.set_image(url=welcome_gif)
+        await channel.send(embed=gif_embed)
+    elif welcome_gif:
+        print(f"GIF inválido ignorado em {member.guild.name}: {welcome_gif}")
 
-    except Exception as e:
-        print(f"Erro ao enviar boas-vindas em {member.guild.name}: {e}")
+except Exception as e:
+    print(f"Erro ao enviar boas-vindas em {member.guild.name}: {e}")
 
 # =========================================================
 # COMANDOS
