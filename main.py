@@ -3,7 +3,9 @@ import sqlite3
 import random
 import itertools
 import asyncio
+import re
 from typing import Optional
+from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands, tasks
@@ -185,6 +187,61 @@ def format_welcome_text(template: str, member: discord.Member) -> str:
         .replace("{server}", member.guild.name)
         .replace("{members}", str(member.guild.member_count))
     )
+
+def clean_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+
+    url = url.strip()
+
+    if (url.startswith('"') and url.endswith('"')) or (url.startswith("'") and url.endswith("'")):
+        url = url[1:-1].strip()
+
+    url = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff]", "", url)
+    return url or None
+
+def is_valid_image_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+
+    url = clean_url(url)
+    if not url:
+        return False
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    if not parsed.netloc:
+        return False
+
+    allowed_extensions = (".gif", ".png", ".jpg", ".jpeg", ".webp")
+    path_lower = parsed.path.lower()
+
+    if path_lower.endswith(allowed_extensions):
+        return True
+
+    trusted_hosts = (
+        "media.tenor.com",
+        "media1.tenor.com",
+        "c.tenor.com",
+        "cdn.discordapp.com",
+        "media.discordapp.net",
+        "i.imgur.com",
+        "imgur.com",
+        "media.giphy.com",
+        "giphy.com",
+    )
+
+    host = parsed.netloc.lower()
+    if any(host == trusted or host.endswith("." + trusted) for trusted in trusted_hosts):
+        return True
+
+    return False
 
 def build_age_embed(guild: discord.Guild) -> discord.Embed:
     e_menos13 = get_emoji_by_name(guild, "menos13")
@@ -398,7 +455,7 @@ async def on_member_join(member: discord.Member):
     member_role_id = cfg.get("member_role_id")
     welcome_channel_id = cfg.get("welcome_channel_id")
     welcome_message = cfg.get("welcome_message") or DEFAULT_WELCOME_MESSAGE
-    welcome_gif = cfg.get("welcome_gif")
+    welcome_gif = clean_url(cfg.get("welcome_gif"))
 
     if member_role_id:
         role = member.guild.get_role(member_role_id)
@@ -421,8 +478,10 @@ async def on_member_join(member: discord.Member):
 
     embed.set_thumbnail(url=member.display_avatar.url)
 
-    if welcome_gif:
+    if welcome_gif and is_valid_image_url(welcome_gif):
         embed.set_image(url=welcome_gif)
+    elif welcome_gif:
+        print(f"GIF inválido ignorado em {member.guild.name}: {welcome_gif}")
 
     embed.set_footer(text=member.guild.name)
 
@@ -470,7 +529,7 @@ async def setup_boasvindas(
 @app_commands.check(admin_only)
 @app_commands.describe(
     mensagem="Usa {user}, {username}, {server}, {members}",
-    gif="Link do gif (opcional)"
+    gif="Link do gif/imagem (opcional)"
 )
 async def mensagem_boasvindas(
     interaction: discord.Interaction,
@@ -479,6 +538,15 @@ async def mensagem_boasvindas(
 ):
     if interaction.guild is None:
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
+        return
+
+    gif = clean_url(gif)
+
+    if gif and not is_valid_image_url(gif):
+        await interaction.response.send_message(
+            "esse link de gif/imagem parece inválido. manda um link direto começando com https://",
+            ephemeral=True
+        )
         return
 
     set_guild_config(
@@ -495,8 +563,22 @@ async def mensagem_boasvindas(
         .replace("{members}", str(interaction.guild.member_count))
     )
 
+    extra = f"\n\ngif salvo: `{gif}`" if gif else "\n\nsem gif."
     await interaction.response.send_message(
-        f"mensagem de boas-vindas salva.\n\nprévia:\n{preview}",
+        f"mensagem de boas-vindas salva.\n\nprévia:\n{preview}{extra}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="limpar_gif_boasvindas", description="Remove o gif salvo da mensagem de boas-vindas")
+@app_commands.check(admin_only)
+async def limpar_gif_boasvindas(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
+        return
+
+    set_guild_config(interaction.guild.id, welcome_gif=None)
+    await interaction.response.send_message(
+        "gif das boas-vindas removido.",
         ephemeral=True
     )
 
@@ -509,7 +591,7 @@ async def preview_boasvindas(interaction: discord.Interaction):
 
     cfg = get_guild_config(interaction.guild.id)
     welcome_message = cfg.get("welcome_message") or DEFAULT_WELCOME_MESSAGE
-    welcome_gif = cfg.get("welcome_gif")
+    welcome_gif = clean_url(cfg.get("welcome_gif"))
 
     text = format_welcome_text(welcome_message, interaction.user)
 
@@ -519,7 +601,7 @@ async def preview_boasvindas(interaction: discord.Interaction):
     )
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
 
-    if welcome_gif:
+    if welcome_gif and is_valid_image_url(welcome_gif):
         embed.set_image(url=welcome_gif)
 
     embed.set_footer(text=interaction.guild.name)
@@ -632,7 +714,7 @@ async def config(interaction: discord.Interaction):
     for name in AGE_EMOJI_NAMES:
         emoji_checks.append(f"{name}: {'✅' if get_emoji_by_name(guild, name) else '❌'}")
 
-    welcome_gif = cfg.get("welcome_gif") or "não definido"
+    welcome_gif = clean_url(cfg.get("welcome_gif")) or "não definido"
 
     text = (
         f"**canal boas-vindas:** {fmt_channel(cfg.get('welcome_channel_id'))}\n"
@@ -665,6 +747,7 @@ async def reset_idade(interaction: discord.Interaction):
 
 @setup_boasvindas.error
 @mensagem_boasvindas.error
+@limpar_gif_boasvindas.error
 @preview_boasvindas.error
 @setup_idade.error
 @postar_idade.error
