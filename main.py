@@ -197,6 +197,10 @@ def clean_url(url: Optional[str]) -> Optional[str]:
         url = url[1:-1].strip()
 
     url = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff]", "", url)
+
+    if url.endswith(".gifv"):
+        url = url[:-5] + ".gif"
+
     return url or None
 
 def is_valid_image_url(url: Optional[str]) -> bool:
@@ -219,6 +223,13 @@ def is_valid_image_url(url: Optional[str]) -> bool:
         return False
 
     return True
+
+def has_allowed_image_extension(url: Optional[str]) -> bool:
+    if not url:
+        return False
+
+    lowered = url.lower()
+    return lowered.endswith((".gif", ".png", ".jpg", ".jpeg", ".webp"))
 
 def build_age_embed(guild: discord.Guild) -> discord.Embed:
     e_menos13 = get_emoji_by_name(guild, "menos13")
@@ -435,18 +446,25 @@ async def on_member_join(member: discord.Member):
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=member.guild.name)
 
+    gif_url = clean_url(welcome_gif)
+
+    if gif_url and is_valid_image_url(gif_url) and has_allowed_image_extension(gif_url):
+        embed.set_image(url=gif_url)
+
     try:
         await asyncio.sleep(1.2)
         await channel.send(embed=embed)
 
-        gif_url = clean_url(welcome_gif)
+    except discord.HTTPException as e:
+        print(f"Erro ao enviar embed de boas-vindas em {member.guild.name}: {e}")
 
-        if gif_url and gif_url.endswith(".gif") and is_valid_image_url(gif_url):
-            gif_embed = discord.Embed()
-            gif_embed.set_image(url=gif_url)
-            await channel.send(embed=gif_embed)
-        elif gif_url:
-            print(f"GIF inválido ignorado em {member.guild.name}: {gif_url}")
+        try:
+            if gif_url and is_valid_image_url(gif_url):
+                await channel.send(content=f"{text}\n{gif_url}")
+            else:
+                await channel.send(content=text)
+        except Exception as e2:
+            print(f"Erro no fallback de boas-vindas em {member.guild.name}: {e2}")
 
     except Exception as e:
         print(f"Erro ao enviar boas-vindas em {member.guild.name}: {e}")
@@ -489,7 +507,7 @@ async def setup_boasvindas(
 @app_commands.check(admin_only)
 @app_commands.describe(
     mensagem="Usa {user}, {username}, {server}, {members}",
-    gif="Link do gif/imagem (opcional)"
+    gif="Link direto do gif/imagem (opcional)"
 )
 async def mensagem_boasvindas(
     interaction: discord.Interaction,
@@ -502,12 +520,20 @@ async def mensagem_boasvindas(
 
     gif = clean_url(gif)
 
-    if gif and not is_valid_image_url(gif):
-        await interaction.response.send_message(
-            "esse link de gif/imagem parece inválido. manda um link direto começando com https://",
-            ephemeral=True
-        )
-        return
+    if gif:
+        if not is_valid_image_url(gif):
+            await interaction.response.send_message(
+                "esse link parece inválido. manda um link direto começando com https://",
+                ephemeral=True
+            )
+            return
+
+        if not has_allowed_image_extension(gif):
+            await interaction.response.send_message(
+                "manda um link direto que termine em .gif, .png, .jpg, .jpeg ou .webp",
+                ephemeral=True
+            )
+            return
 
     set_guild_config(
         interaction.guild.id,
@@ -562,8 +588,8 @@ async def preview_boasvindas(interaction: discord.Interaction):
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
     embed.set_footer(text=interaction.guild.name)
 
-    if welcome_gif and is_valid_image_url(welcome_gif):
-        embed.add_field(name="gif", value=welcome_gif, inline=False)
+    if welcome_gif and is_valid_image_url(welcome_gif) and has_allowed_image_extension(welcome_gif):
+        embed.set_image(url=welcome_gif)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
