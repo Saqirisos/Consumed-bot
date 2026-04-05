@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import random
 import itertools
 import asyncio
 import re
@@ -12,7 +11,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 
 # =========================================================
-# CONFIG GERAL
+# CONFIG
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -219,29 +218,7 @@ def is_valid_image_url(url: Optional[str]) -> bool:
     if not parsed.netloc:
         return False
 
-    allowed_extensions = (".gif", ".png", ".jpg", ".jpeg", ".webp")
-    path_lower = parsed.path.lower()
-
-    if path_lower.endswith(allowed_extensions):
-        return True
-
-    trusted_hosts = (
-        "media.tenor.com",
-        "media1.tenor.com",
-        "c.tenor.com",
-        "cdn.discordapp.com",
-        "media.discordapp.net",
-        "i.imgur.com",
-        "imgur.com",
-        "media.giphy.com",
-        "giphy.com",
-    )
-
-    host = parsed.netloc.lower()
-    if any(host == trusted or host.endswith("." + trusted) for trusted in trusted_hosts):
-        return True
-
-    return False
+    return True
 
 def build_age_embed(guild: discord.Guild) -> discord.Embed:
     e_menos13 = get_emoji_by_name(guild, "menos13")
@@ -308,7 +285,7 @@ async def change_status():
     )
 
 # =========================================================
-# VIEW DOS BOTÕES
+# AGE VIEW
 # =========================================================
 
 class AgeView(discord.ui.View):
@@ -375,39 +352,19 @@ class AgeView(discord.ui.View):
                 ephemeral=True
             )
 
-    @discord.ui.button(
-        label="-13",
-        style=discord.ButtonStyle.secondary,
-        custom_id="age_menos13",
-        row=0
-    )
+    @discord.ui.button(label="-13", style=discord.ButtonStyle.secondary, custom_id="age_menos13", row=0)
     async def menos13(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_role(interaction, "menos13")
 
-    @discord.ui.button(
-        label="+13",
-        style=discord.ButtonStyle.primary,
-        custom_id="age_mais13",
-        row=0
-    )
+    @discord.ui.button(label="+13", style=discord.ButtonStyle.primary, custom_id="age_mais13", row=0)
     async def mais13(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_role(interaction, "mais13")
 
-    @discord.ui.button(
-        label="+18",
-        style=discord.ButtonStyle.danger,
-        custom_id="age_mais18",
-        row=0
-    )
+    @discord.ui.button(label="+18", style=discord.ButtonStyle.danger, custom_id="age_mais18", row=0)
     async def mais18(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_role(interaction, "mais18")
 
-    @discord.ui.button(
-        label="+21",
-        style=discord.ButtonStyle.success,
-        custom_id="age_mais21",
-        row=0
-    )
+    @discord.ui.button(label="+21", style=discord.ButtonStyle.success, custom_id="age_mais21", row=0)
     async def mais21(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_role(interaction, "mais21")
 
@@ -432,7 +389,7 @@ def build_age_view_for_guild(guild: discord.Guild) -> AgeView:
     return view
 
 # =========================================================
-# EVENTOS
+# EVENTS
 # =========================================================
 
 @bot.event
@@ -475,7 +432,6 @@ async def on_member_join(member: discord.Member):
         description=text,
         color=discord.Color.from_rgb(0, 0, 0)
     )
-
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=member.guild.name)
 
@@ -483,19 +439,20 @@ async def on_member_join(member: discord.Member):
         await asyncio.sleep(1.2)
         await channel.send(embed=embed)
 
-        # manda o gif separado pra animar de verdade
-        if welcome_gif and is_valid_image_url(welcome_gif):
+        gif_url = clean_url(welcome_gif)
+
+        if gif_url and gif_url.endswith(".gif") and is_valid_image_url(gif_url):
             gif_embed = discord.Embed()
-            gif_embed.set_image(url=welcome_gif)
+            gif_embed.set_image(url=gif_url)
             await channel.send(embed=gif_embed)
-        elif welcome_gif:
-            print(f"GIF inválido ignorado em {member.guild.name}: {welcome_gif}")
+        elif gif_url:
+            print(f"GIF inválido ignorado em {member.guild.name}: {gif_url}")
 
     except Exception as e:
         print(f"Erro ao enviar boas-vindas em {member.guild.name}: {e}")
 
 # =========================================================
-# COMANDOS
+# COMMANDS
 # =========================================================
 
 @bot.tree.command(name="ping", description="Ver a latência do bot")
