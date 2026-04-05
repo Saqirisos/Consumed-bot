@@ -477,17 +477,18 @@ async def on_member_join(member: discord.Member):
     )
 
     embed.set_thumbnail(url=member.display_avatar.url)
-
-    if welcome_gif and is_valid_image_url(welcome_gif):
-        embed.set_image(url=welcome_gif)
-    elif welcome_gif:
-        print(f"GIF inválido ignorado em {member.guild.name}: {welcome_gif}")
-
     embed.set_footer(text=member.guild.name)
 
     try:
         await asyncio.sleep(1.2)
         await channel.send(embed=embed)
+
+        # manda o gif separado pra animar de verdade
+        if welcome_gif and is_valid_image_url(welcome_gif):
+            await channel.send(welcome_gif)
+        elif welcome_gif:
+            print(f"GIF inválido ignorado em {member.guild.name}: {welcome_gif}")
+
     except Exception as e:
         print(f"Erro ao enviar boas-vindas em {member.guild.name}: {e}")
 
@@ -600,11 +601,10 @@ async def preview_boasvindas(interaction: discord.Interaction):
         color=discord.Color.from_rgb(0, 0, 0)
     )
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.set_footer(text=interaction.guild.name)
 
     if welcome_gif and is_valid_image_url(welcome_gif):
-        embed.set_image(url=welcome_gif)
-
-    embed.set_footer(text=interaction.guild.name)
+        embed.add_field(name="gif", value=welcome_gif, inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
