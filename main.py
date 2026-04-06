@@ -456,6 +456,23 @@ def build_reject_embed(target_member: Optional[discord.Member]) -> discord.Embed
     return embed
 
 
+def build_approve_embed(target_member: Optional[discord.Member], verify_role: Optional[discord.Role]) -> discord.Embed:
+    mention = target_member.mention if target_member else "usuário"
+    role_text = verify_role.mention if verify_role else "`cargo não encontrado`"
+
+    embed = discord.Embed(
+        title="✦ verificação aprovada",
+        description=(
+            f"{mention}, sua verificação foi aprovada.\n\n"
+            "**cargo recebido**\n"
+            f"> {role_text}\n\n"
+            "bem-vindo ao servidor."
+        ),
+        color=discord.Color.green(),
+    )
+    return embed
+
+
 def find_staff_role(guild: discord.Guild) -> Optional[discord.Role]:
     return discord.utils.find(
         lambda r: r.name.lower() == VERIFY_STAFF_ROLE_NAME.lower(),
@@ -701,10 +718,8 @@ class TicketActionView(discord.ui.View):
             if verify_role not in target_member.roles:
                 await target_member.add_roles(verify_role)
 
-            await interaction.response.send_message(
-                f"{target_member.mention} foi aprovado e recebeu o cargo {verify_role.mention}.",
-                ephemeral=False,
-            )
+            embed = build_approve_embed(target_member, verify_role)
+            await interaction.response.send_message(embed=embed, ephemeral=False)
 
             await send_verify_log(
                 guild,
