@@ -63,9 +63,8 @@ DEFAULT_VERIFY_MESSAGE = (
 )
 
 DEFAULT_REJECT_MESSAGE = (
-    "{user}, sua verificação **não foi aprovada**.\n\n"
-    "Se quiser tentar novamente, fale com a staff e envie uma nova verificação real.\n"
-    "**Perfis fake, fotos de terceiros ou conteúdo enganoso não são aceitos.**"
+    "{user}, sua verificação não foi aprovada. "
+    "Envie uma foto real e clara caso queira tentar novamente."
 )
 
 # =========================================================
@@ -437,6 +436,26 @@ pra manter o servidor seguro e evitar fakes, é necessário concluir sua verific
 ✦ escolha com qual staff deseja verificar
 """
 
+def build_reject_embed(target_member: Optional[discord.Member]) -> discord.Embed:
+    mention = target_member.mention if target_member else "usuário"
+
+    embed = discord.Embed(
+        title="✦ verificação recusada",
+        description=(
+            f"{mention}, sua verificação não foi aprovada.\n\n"
+            "**motivo**\n"
+            "• imagem fora do padrão\n"
+            "• inconsistências identificadas\n\n"
+            "**o que fazer**\n"
+            "• envie uma foto real e clara\n"
+            "• evite filtros ou fotos de terceiros\n\n"
+            "tentativas inválidas podem resultar em bloqueio"
+        ),
+        color=discord.Color.red(),
+    )
+    return embed
+
+
 def find_staff_role(guild: discord.Guild) -> Optional[discord.Role]:
     return discord.utils.find(
         lambda r: r.name.lower() == VERIFY_STAFF_ROLE_NAME.lower(),
@@ -716,11 +735,9 @@ class TicketActionView(discord.ui.View):
 
         target_user_id = get_ticket_user_id(channel)
         target_member = guild.get_member(target_user_id) if target_user_id else None
-        cfg = get_guild_config(guild.id)
-        reject_message = cfg.get("reject_message") or DEFAULT_REJECT_MESSAGE
-        formatted = reject_message.replace("{user}", target_member.mention if target_member else "usuário")
 
-        await interaction.response.send_message(formatted, ephemeral=False)
+        embed = build_reject_embed(target_member)
+        await interaction.response.send_message(embed=embed, ephemeral=False)
 
         await send_verify_log(
             guild,
