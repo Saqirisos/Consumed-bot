@@ -37,6 +37,9 @@ STATUS_LIST = [
     "you were everything."
 ]
 
+VERIFY_STAFF_ROLE_NAME = "staff"
+VERIFY_BANNER_URL = "https://i.imgur.com/PwrzJ7z.png"
+
 # =========================================================
 # DATABASE
 # =========================================================
@@ -260,6 +263,38 @@ def build_age_embed(guild: discord.Guild) -> discord.Embed:
     embed.set_footer(text="one choice only.")
     return embed
 
+def find_staff_role(guild: discord.Guild) -> Optional[discord.Role]:
+    return discord.utils.find(
+        lambda r: r.name.lower() == VERIFY_STAFF_ROLE_NAME.lower(),
+        guild.roles
+    )
+
+def get_staff_members(guild: discord.Guild) -> list[discord.Member]:
+    staff_role = find_staff_role(guild)
+    if not staff_role:
+        return []
+
+    members = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        if staff_role in member.roles:
+            members.append(member)
+
+    return members
+
+def sanitize_channel_name(name: str) -> str:
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9-_]", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name or "usuario"
+
+def find_existing_verify_channel(guild: discord.Guild, user_id: int) -> Optional[discord.TextChannel]:
+    for channel in guild.text_channels:
+        if channel.topic == f"verify_user:{user_id}":
+            return channel
+    return None
+
 # =========================================================
 # BOT
 # =========================================================
@@ -276,6 +311,7 @@ class Consumed(commands.Bot):
     async def setup_hook(self):
         init_db()
         self.add_view(AgeView())
+        self.add_view(StartVerifyPersistentView())
 
 bot = Consumed()
 
@@ -398,6 +434,231 @@ def build_age_view_for_guild(guild: discord.Guild) -> AgeView:
                     item.emoji = emoji
 
     return view
+
+# =========================================================
+# VERIFY SYSTEM
+# =========================================================
+
+class CloseTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Fechar ticket",
+        style=discord.ButtonStyle.danger,
+        custom_id="verify_close_ticket"
+    )
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        channel = interaction.channel
+        user = interaction.user
+
+        if guild is None or not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("isso só funciona dentro do servidor.", ephemeral=True)
+            return
+
+        allowed = False
+        staff_role = find_staff_role(guild)
+
+        if isinstance(user, discord.Member):
+            if user.guild_permissions.administrator:
+                allowed = True
+            if staff_role and staff_role in user.roles:
+                allowed = True
+            if channel.topic == f"verify_user:{user.id}":
+                allowed = True
+
+        if not allowed:
+            await interaction.response.send_message(
+                "só staff, admin, ou quem abriu pode fechar esse ticket.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message("fechando em 2 segundos...")
+        await asyncio.sleep(2)
+        await channel.delete()
+
+class StaffSelect(discord.ui.Select):
+    def __init__(self, guild: discord.Guild, requester: discord.Member):
+        self.guild = guild
+        self.requester = requester
+
+        staff_members = get_staff_members(guild)
+
+        options = [
+            discord.SelectOption(
+                label=member.display_name[:100],
+                value=str(member.id),
+                description=f"ID: {member.id}"
+            )
+            for member in staff_members[:25]
+        ]
+
+        super().__init__(
+            placeholder="Escolha um verificador...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        user = interaction.user
+
+        if guild is None or not isinstance(user, discord.Member):
+            await interaction.response.send_message("isso só funciona dentro do servidor.", ephemeral=True)
+            return
+
+        if user.id != self.requester.id:
+            await interaction.response.send_message("esse menu não é seu.", ephemeral=True)
+            return
+
+        existing = find_existing_verify_channel(guild, user.id)
+        if existing:
+            await interaction.response.send_message(
+                f"você já tem um ticket aberto: {existing.mention}",
+                ephemeral=True
+            )
+            return
+
+        staff_id = int(self.values[0])
+        staff_member = guild.get_member(staff_id)
+
+        if not staff_member:
+            await interaction.response.send_message(
+                "não encontrei esse staff. tenta de novo.",
+                ephemeral=True
+            )
+            return
+
+        channel_name = f"verify-{sanitize_channel_name(user.name)}"
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True
+            ),
+            staff_member: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True,
+                manage_messages=True,
+                attach_files=True,
+                embed_links=True
+            ),
+        }
+
+        staff_role = find_staff_role(guild)
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True
+            )
+
+        try:
+            created_channel = await guild.create_text_channel(
+                name=channel_name,
+                overwrites=overwrites,
+                topic=f"verify_user:{user.id}"
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "não consegui criar o canal. vê se eu tenho permissão de gerenciar canais.",
+                ephemeral=True
+            )
+            return
+        except Exception as e:
+            await interaction.response.send_message(
+                f"deu erro ao criar o canal: `{e}`",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="verificação iniciada",
+            description=(
+                f"{user.mention}, envie sua verificação aqui.\n\n"
+                f"verificador escolhido: {staff_member.mention}\n\n"
+                "aguarde a análise da staff."
+            ),
+            color=discord.Color.from_rgb(0, 0, 0)
+        )
+        embed.set_footer(text=guild.name)
+
+        await created_channel.send(
+            content=f"{user.mention} {staff_member.mention}",
+            embed=embed,
+            view=CloseTicketView()
+        )
+
+        await interaction.response.send_message(
+            f"ticket criado em {created_channel.mention}",
+            ephemeral=True
+        )
+
+class StaffPickerView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, requester: discord.Member):
+        super().__init__(timeout=180)
+        self.add_item(StaffSelect(guild, requester))
+
+class StartVerifyPersistentView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Iniciar verificação",
+        style=discord.ButtonStyle.secondary,
+        custom_id="verify_start_button"
+    )
+    async def start_verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        user = interaction.user
+
+        if guild is None or not isinstance(user, discord.Member):
+            await interaction.response.send_message(
+                "isso só funciona dentro do servidor.",
+                ephemeral=True
+            )
+            return
+
+        existing = find_existing_verify_channel(guild, user.id)
+        if existing:
+            await interaction.response.send_message(
+                f"você já tem um ticket aberto: {existing.mention}",
+                ephemeral=True
+            )
+            return
+
+        staff_members = get_staff_members(guild)
+        if not staff_members:
+            await interaction.response.send_message(
+                f"não achei ninguém com o cargo `{VERIFY_STAFF_ROLE_NAME}`.",
+                ephemeral=True
+            )
+            return
+
+        view = StaffPickerView(guild, user)
+        await interaction.response.send_message(
+            "escolha abaixo com quem você quer verificar:",
+            view=view,
+            ephemeral=True
+        )
 
 # =========================================================
 # EVENTS
@@ -672,6 +933,37 @@ async def postar_idade(interaction: discord.Interaction):
         ephemeral=True
     )
 
+@bot.tree.command(name="postar_verificacao", description="Posta o painel de verificação")
+@app_commands.check(admin_only)
+async def postar_verificacao(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
+        return
+
+    staff_members = get_staff_members(interaction.guild)
+    if not staff_members:
+        await interaction.response.send_message(
+            f"não achei ninguém com o cargo `{VERIFY_STAFF_ROLE_NAME}`.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Verificação",
+        description=(
+            "clique no botão abaixo para iniciar sua verificação.\n\n"
+            "depois escolha com qual staff você quer verificar."
+        ),
+        color=discord.Color.from_rgb(0, 0, 0)
+    )
+
+    embed.set_image(url=VERIFY_BANNER_URL)
+
+    view = StartVerifyPersistentView()
+
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("painel de verificação enviado.", ephemeral=True)
+
 @bot.tree.command(name="config", description="Mostra a configuração atual do servidor")
 @app_commands.check(admin_only)
 async def config(interaction: discord.Interaction):
@@ -700,13 +992,15 @@ async def config(interaction: discord.Interaction):
         emoji_checks.append(f"{name}: {'✅' if get_emoji_by_name(guild, name) else '❌'}")
 
     welcome_gif = clean_url(cfg.get("welcome_gif")) or "não definido"
+    staff_role = find_staff_role(guild)
 
     text = (
         f"**canal boas-vindas:** {fmt_channel(cfg.get('welcome_channel_id'))}\n"
         f"**cargo automático:** {fmt_role(cfg.get('member_role_id'))}\n"
         f"**canal idade:** {fmt_channel(cfg.get('age_channel_id'))}\n"
         f"**mensagem idade id:** `{cfg.get('age_message_id') or 'não definida'}`\n"
-        f"**gif boas-vindas:** `{welcome_gif}`\n\n"
+        f"**gif boas-vindas:** `{welcome_gif}`\n"
+        f"**cargo staff verificação:** {staff_role.mention if staff_role else '`não encontrado`'}\n\n"
         f"**-13:** {fmt_role(age_roles.get('menos13'))}\n"
         f"**+13:** {fmt_role(age_roles.get('mais13'))}\n"
         f"**+18:** {fmt_role(age_roles.get('mais18'))}\n"
@@ -736,6 +1030,7 @@ async def reset_idade(interaction: discord.Interaction):
 @preview_boasvindas.error
 @setup_idade.error
 @postar_idade.error
+@postar_verificacao.error
 @config.error
 @reset_idade.error
 async def admin_command_error(interaction: discord.Interaction, error):
