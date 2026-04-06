@@ -1257,7 +1257,3 @@ async def admin_command_error(interaction: discord.Interaction, error):
 # =========================================================
 
 bot.run(TOKEN)
-
-
-# --- ensure bot runs ---
-bot.run(TOKEN)
