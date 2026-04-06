@@ -40,6 +40,20 @@ STATUS_LIST = [
 VERIFY_STAFF_ROLE_NAME = "staff"
 VERIFY_BANNER_URL = "https://i.imgur.com/PwrzJ7z.png"
 
+DEFAULT_VERIFY_MESSAGE = (
+    "**Verificação**\n\n"
+    "A verificação garante a veracidade das postagens.\n"
+    "Verifique-se para ter acesso aos canais desejados.\n\n"
+    "**Como funciona?**\n"
+    "01 Você terá que mostrar seu rosto para um admin/staff;\n"
+    "02 Ninguém terá acesso às provas da sua verificação.\n\n"
+    "**Escolha alguma das pessoas abaixo:**\n"
+    "{staff_list}\n\n"
+    "Este canal é exclusivo para fotos do seu próprio rosto.\n"
+    "Evite postar imagens de terceiros e conteúdo enganoso.\n"
+    "O descumprimento pode resultar em remoção da verificação."
+)
+
 # =========================================================
 # DATABASE
 # =========================================================
@@ -76,22 +90,62 @@ def init_db():
                 PRIMARY KEY (guild_id, age_key)
             )
         """)
+
+        existing_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(guild_config)").fetchall()
+        }
+
+        migrations = {
+            "verify_category_id": "ALTER TABLE guild_config ADD COLUMN verify_category_id INTEGER",
+            "verify_role_id": "ALTER TABLE guild_config ADD COLUMN verify_role_id INTEGER",
+            "verify_message": "ALTER TABLE guild_config ADD COLUMN verify_message TEXT",
+        }
+
+        for col_name, sql in migrations.items():
+            if col_name not in existing_cols:
+                conn.execute(sql)
+
         conn.commit()
 
 def ensure_guild_row(guild_id: int):
+    ensure_db_dir()
     with get_conn() as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO guild_config (
-                guild_id,
-                welcome_channel_id,
-                member_role_id,
-                age_channel_id,
-                age_message_id,
-                welcome_message,
-                welcome_gif
-            )
-            VALUES (?, NULL, NULL, NULL, NULL, ?, NULL)
-        """, (guild_id, DEFAULT_WELCOME_MESSAGE))
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(guild_config)").fetchall()
+        }
+
+        if {"verify_category_id", "verify_role_id", "verify_message"}.issubset(columns):
+            conn.execute("""
+                INSERT OR IGNORE INTO guild_config (
+                    guild_id,
+                    welcome_channel_id,
+                    member_role_id,
+                    age_channel_id,
+                    age_message_id,
+                    welcome_message,
+                    welcome_gif,
+                    verify_category_id,
+                    verify_role_id,
+                    verify_message
+                )
+                VALUES (?, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?)
+            """, (guild_id, DEFAULT_WELCOME_MESSAGE, DEFAULT_VERIFY_MESSAGE))
+        else:
+            conn.execute("""
+                INSERT OR IGNORE INTO guild_config (
+                    guild_id,
+                    welcome_channel_id,
+                    member_role_id,
+                    age_channel_id,
+                    age_message_id,
+                    welcome_message,
+                    welcome_gif
+                )
+                VALUES (?, NULL, NULL, NULL, NULL, ?, NULL)
+            """, (guild_id, DEFAULT_WELCOME_MESSAGE))
+
         conn.commit()
 
 def get_guild_config(guild_id: int) -> dict:
@@ -113,6 +167,9 @@ def set_guild_config(guild_id: int, **kwargs):
         "age_message_id",
         "welcome_message",
         "welcome_gif",
+        "verify_category_id",
+        "verify_role_id",
+        "verify_message",
     }
 
     fields = []
@@ -175,6 +232,23 @@ async def get_text_channel(guild: discord.Guild, channel_id: Optional[int]):
     try:
         fetched = await bot.fetch_channel(channel_id)
         if isinstance(fetched, discord.TextChannel):
+            return fetched
+    except Exception:
+        return None
+
+    return None
+
+async def get_category_channel(guild: discord.Guild, category_id: Optional[int]):
+    if not category_id:
+        return None
+
+    category = guild.get_channel(category_id)
+    if category is not None and isinstance(category, discord.CategoryChannel):
+        return category
+
+    try:
+        fetched = await bot.fetch_channel(category_id)
+        if isinstance(fetched, discord.CategoryChannel):
             return fetched
     except Exception:
         return None
@@ -274,14 +348,23 @@ def get_staff_members(guild: discord.Guild) -> list[discord.Member]:
     if not staff_role:
         return []
 
-    members = []
-    for member in guild.members:
-        if member.bot:
-            continue
-        if staff_role in member.roles:
-            members.append(member)
+    return [
+        member for member in guild.members
+        if not member.bot and staff_role in member.roles
+    ]
 
-    return members
+def format_verify_message(template: str, guild: discord.Guild) -> str:
+    staff_members = get_staff_members(guild)
+    if staff_members:
+        staff_list = " | ".join(member.mention for member in staff_members)
+    else:
+        staff_list = "`nenhum staff configurado`"
+
+    return (
+        template
+        .replace("{server}", guild.name)
+        .replace("{staff_list}", staff_list)
+    )
 
 def sanitize_channel_name(name: str) -> str:
     name = name.lower()
@@ -294,6 +377,19 @@ def find_existing_verify_channel(guild: discord.Guild, user_id: int) -> Optional
         if channel.topic == f"verify_user:{user_id}":
             return channel
     return None
+
+def get_ticket_user_id(channel: discord.TextChannel) -> Optional[int]:
+    if not channel.topic:
+        return None
+
+    match = re.fullmatch(r"verify_user:(\d+)", channel.topic.strip())
+    if not match:
+        return None
+
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
 
 # =========================================================
 # BOT
@@ -312,6 +408,7 @@ class Consumed(commands.Bot):
         init_db()
         self.add_view(AgeView())
         self.add_view(StartVerifyPersistentView())
+        self.add_view(TicketActionView())
 
 bot = Consumed()
 
@@ -439,13 +536,103 @@ def build_age_view_for_guild(guild: discord.Guild) -> AgeView:
 # VERIFY SYSTEM
 # =========================================================
 
-class CloseTicketView(discord.ui.View):
+class TicketActionView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    def _can_staff_act(self, guild: discord.Guild, user: discord.Member) -> bool:
+        staff_role = find_staff_role(guild)
+        return bool(user.guild_permissions.administrator or (staff_role and staff_role in user.roles))
+
+    @discord.ui.button(
+        label="Aprovar",
+        style=discord.ButtonStyle.success,
+        custom_id="verify_approve_ticket"
+    )
+    async def approve_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        channel = interaction.channel
+        actor = interaction.user
+
+        if guild is None or not isinstance(channel, discord.TextChannel) or not isinstance(actor, discord.Member):
+            await interaction.response.send_message("isso só funciona dentro do servidor.", ephemeral=True)
+            return
+
+        if not self._can_staff_act(guild, actor):
+            await interaction.response.send_message("só a staff ou admin pode aprovar.", ephemeral=True)
+            return
+
+        target_user_id = get_ticket_user_id(channel)
+        if not target_user_id:
+            await interaction.response.send_message("não consegui identificar o usuário desse ticket.", ephemeral=True)
+            return
+
+        target_member = guild.get_member(target_user_id)
+        if not target_member:
+            await interaction.response.send_message("o usuário não está mais no servidor.", ephemeral=True)
+            return
+
+        cfg = get_guild_config(guild.id)
+        verify_role_id = cfg.get("verify_role_id")
+
+        if not verify_role_id:
+            await interaction.response.send_message(
+                "cargo de verificação não configurado. usa `/setup_verificacao` primeiro.",
+                ephemeral=True
+            )
+            return
+
+        verify_role = guild.get_role(verify_role_id)
+        if not verify_role:
+            await interaction.response.send_message("o cargo configurado de verificação não foi encontrado.", ephemeral=True)
+            return
+
+        try:
+            if verify_role not in target_member.roles:
+                await target_member.add_roles(verify_role)
+
+            await interaction.response.send_message(
+                f"{target_member.mention} foi aprovado e recebeu o cargo {verify_role.mention}.",
+                ephemeral=False
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "não consegui dar o cargo. deixa meu cargo acima do cargo de verificação.",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"deu erro ao aprovar: `{e}`", ephemeral=True)
+
+    @discord.ui.button(
+        label="Recusar",
+        style=discord.ButtonStyle.danger,
+        custom_id="verify_reject_ticket"
+    )
+    async def reject_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        channel = interaction.channel
+        actor = interaction.user
+
+        if guild is None or not isinstance(channel, discord.TextChannel) or not isinstance(actor, discord.Member):
+            await interaction.response.send_message("isso só funciona dentro do servidor.", ephemeral=True)
+            return
+
+        if not self._can_staff_act(guild, actor):
+            await interaction.response.send_message("só a staff ou admin pode recusar.", ephemeral=True)
+            return
+
+        target_user_id = get_ticket_user_id(channel)
+        target_member = guild.get_member(target_user_id) if target_user_id else None
+        mention = target_member.mention if target_member else "usuário"
+
+        await interaction.response.send_message(
+            f"{mention}, sua verificação foi recusada. fale com a staff para tentar novamente.",
+            ephemeral=False
+        )
+
     @discord.ui.button(
         label="Fechar ticket",
-        style=discord.ButtonStyle.danger,
+        style=discord.ButtonStyle.secondary,
         custom_id="verify_close_ticket"
     )
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -453,20 +640,19 @@ class CloseTicketView(discord.ui.View):
         channel = interaction.channel
         user = interaction.user
 
-        if guild is None or not isinstance(channel, discord.TextChannel):
+        if guild is None or not isinstance(channel, discord.TextChannel) or not isinstance(user, discord.Member):
             await interaction.response.send_message("isso só funciona dentro do servidor.", ephemeral=True)
             return
 
         allowed = False
         staff_role = find_staff_role(guild)
 
-        if isinstance(user, discord.Member):
-            if user.guild_permissions.administrator:
-                allowed = True
-            if staff_role and staff_role in user.roles:
-                allowed = True
-            if channel.topic == f"verify_user:{user.id}":
-                allowed = True
+        if user.guild_permissions.administrator:
+            allowed = True
+        elif staff_role and staff_role in user.roles:
+            allowed = True
+        elif channel.topic == f"verify_user:{user.id}":
+            allowed = True
 
         if not allowed:
             await interaction.response.send_message(
@@ -496,7 +682,7 @@ class StaffSelect(discord.ui.Select):
         ]
 
         super().__init__(
-            placeholder="Escolha um verificador...",
+            placeholder="Selecione um verificador...",
             min_values=1,
             max_values=1,
             options=options
@@ -532,7 +718,10 @@ class StaffSelect(discord.ui.Select):
             )
             return
 
-        channel_name = f"verify-{sanitize_channel_name(user.name)}"
+        cfg = get_guild_config(guild.id)
+        category = await get_category_channel(guild, cfg.get("verify_category_id"))
+
+        channel_name = f"verify-{sanitize_channel_name(user.name)}-{str(user.id)[-4:]}"
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -575,7 +764,8 @@ class StaffSelect(discord.ui.Select):
             created_channel = await guild.create_text_channel(
                 name=channel_name,
                 overwrites=overwrites,
-                topic=f"verify_user:{user.id}"
+                topic=f"verify_user:{user.id}",
+                category=category
             )
         except discord.Forbidden:
             await interaction.response.send_message(
@@ -604,7 +794,7 @@ class StaffSelect(discord.ui.Select):
         await created_channel.send(
             content=f"{user.mention} {staff_member.mention}",
             embed=embed,
-            view=CloseTicketView()
+            view=TicketActionView()
         )
 
         await interaction.response.send_message(
@@ -933,12 +1123,63 @@ async def postar_idade(interaction: discord.Interaction):
         ephemeral=True
     )
 
+@bot.tree.command(name="setup_verificacao", description="Configura a categoria e o cargo da verificação")
+@app_commands.check(admin_only)
+@app_commands.describe(
+    categoria="Categoria onde os tickets de verificação vão abrir",
+    cargo_aprovado="Cargo que a pessoa recebe ao ser aprovada"
+)
+async def setup_verificacao(
+    interaction: discord.Interaction,
+    categoria: discord.CategoryChannel,
+    cargo_aprovado: discord.Role
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
+        return
+
+    set_guild_config(
+        interaction.guild.id,
+        verify_category_id=categoria.id,
+        verify_role_id=cargo_aprovado.id
+    )
+
+    await interaction.response.send_message(
+        (
+            "configuração de verificação salva.\n\n"
+            f"categoria: {categoria.name}\n"
+            f"cargo ao aprovar: {cargo_aprovado.mention}"
+        ),
+        ephemeral=True
+    )
+
+@bot.tree.command(name="mensagem_verificacao", description="Define o texto do painel de verificação")
+@app_commands.check(admin_only)
+@app_commands.describe(
+    mensagem="Você pode usar {server} e {staff_list}"
+)
+async def mensagem_verificacao(interaction: discord.Interaction, mensagem: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
+        return
+
+    set_guild_config(interaction.guild.id, verify_message=mensagem)
+
+    preview = format_verify_message(mensagem, interaction.guild)
+    await interaction.response.send_message(
+        f"mensagem de verificação salva.\n\nprévia:\n{preview}",
+        ephemeral=True
+    )
+
 @bot.tree.command(name="postar_verificacao", description="Posta o painel de verificação")
 @app_commands.check(admin_only)
 async def postar_verificacao(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
         return
+
+    cfg = get_guild_config(interaction.guild.id)
+    verify_message = cfg.get("verify_message") or DEFAULT_VERIFY_MESSAGE
 
     staff_members = get_staff_members(interaction.guild)
     if not staff_members:
@@ -949,14 +1190,9 @@ async def postar_verificacao(interaction: discord.Interaction):
         return
 
     embed = discord.Embed(
-        title="Verificação",
-        description=(
-            "clique no botão abaixo para iniciar sua verificação.\n\n"
-            "depois escolha com qual staff você quer verificar."
-        ),
+        description=format_verify_message(verify_message, interaction.guild),
         color=discord.Color.from_rgb(0, 0, 0)
     )
-
     embed.set_image(url=VERIFY_BANNER_URL)
 
     view = StartVerifyPersistentView()
@@ -987,6 +1223,12 @@ async def config(interaction: discord.Interaction):
         role = guild.get_role(role_id)
         return role.mention if role else f"`{role_id}`"
 
+    def fmt_category(category_id):
+        if not category_id:
+            return "`não definida`"
+        category = guild.get_channel(category_id)
+        return category.name if isinstance(category, discord.CategoryChannel) else f"`{category_id}`"
+
     emoji_checks = []
     for name in AGE_EMOJI_NAMES:
         emoji_checks.append(f"{name}: {'✅' if get_emoji_by_name(guild, name) else '❌'}")
@@ -1000,7 +1242,9 @@ async def config(interaction: discord.Interaction):
         f"**canal idade:** {fmt_channel(cfg.get('age_channel_id'))}\n"
         f"**mensagem idade id:** `{cfg.get('age_message_id') or 'não definida'}`\n"
         f"**gif boas-vindas:** `{welcome_gif}`\n"
-        f"**cargo staff verificação:** {staff_role.mention if staff_role else '`não encontrado`'}\n\n"
+        f"**cargo staff verificação:** {staff_role.mention if staff_role else '`não encontrado`'}\n"
+        f"**categoria verificação:** {fmt_category(cfg.get('verify_category_id'))}\n"
+        f"**cargo ao aprovar:** {fmt_role(cfg.get('verify_role_id'))}\n\n"
         f"**-13:** {fmt_role(age_roles.get('menos13'))}\n"
         f"**+13:** {fmt_role(age_roles.get('mais13'))}\n"
         f"**+18:** {fmt_role(age_roles.get('mais18'))}\n"
@@ -1030,6 +1274,8 @@ async def reset_idade(interaction: discord.Interaction):
 @preview_boasvindas.error
 @setup_idade.error
 @postar_idade.error
+@setup_verificacao.error
+@mensagem_verificacao.error
 @postar_verificacao.error
 @config.error
 @reset_idade.error
