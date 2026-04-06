@@ -1094,15 +1094,45 @@ async def postar_verificacao(interaction: discord.Interaction):
         return
 
     cfg = get_guild_config(interaction.guild.id)
-    verify_message = cfg.get("verify_message") or DEFAULT_VERIFY_MESSAGE
+    # mensagem fixa (sem bug de 
+)
+    mensagem = """**✦・VERIFICAÇÃO・✦**
+━━━━━━━━━━━━━━━━━━━
 
-    staff_members = get_staff_members(interaction.guild)
-    if not staff_members:
-        await interaction.response.send_message(f"não achei ninguém com o cargo `{VERIFY_STAFF_ROLE_NAME}`.", ephemeral=True)
-        return
+pra manter o servidor seguro e evitar fakes, é necessário concluir sua verificação antes de acessar tudo.
+
+**✦ como funciona**
+> • você abrirá um chat privado com a staff
+> • será solicitado uma foto do seu rosto em tempo real
+> • após análise, você receberá acesso completo
+
+━━━━━━━━━━━━━━━━━━━
+
+**✦ segurança**
+> • o processo acontece em um canal totalmente privado
+> • apenas você e a staff terão acesso
+> • nenhuma imagem ou informação será salva
+> • tudo é apagado após a verificação
+
+━━━━━━━━━━━━━━━━━━━
+
+**✦ importante**
+> • utilize apenas fotos suas
+> • não tente burlar o sistema
+> • inconsistências resultarão em recusa imediata
+
+━━━━━━━━━━━━━━━━━━━
+
+> ao iniciar, você concorda com todas as regras acima
+
+✦ clique no botão abaixo para iniciar
+✦ escolha com qual staff deseja verificar
+"""
 
     embed = discord.Embed(
-        description=format_verify_message(verify_message, interaction.guild),
+        description=mensagem,
+        color=discord.Color.from_rgb(0, 0, 0)
+    ),
         color=discord.Color.from_rgb(0, 0, 0)
     )
     embed.set_image(url=VERIFY_BANNER_URL)
@@ -1229,3 +1259,7 @@ async def admin_command_error(interaction: discord.Interaction, error):
 # =========================================================
 
 bot.run(TOKEN)
+
+# --- ensure bot runs ---
+bot.run(TOKEN)
+
