@@ -3,6 +3,7 @@ import sqlite3
 import itertools
 import asyncio
 import re
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -21,6 +22,10 @@ if not TOKEN:
     raise ValueError("A variável DISCORD_BOT_TOKEN não foi encontrada.")
 
 AGE_EMOJI_NAMES = ["menos13", "mais13", "mais18", "mais21"]
+VERIFY_STAFF_ROLE_NAME = "staff"
+VERIFY_BANNER_URL = "https://i.imgur.com/PwrzJ7z.png"
+TICKET_COOLDOWN_SECONDS = 30
+MAX_VERIFY_TICKETS_PER_USER = 1
 
 DEFAULT_WELCOME_MESSAGE = (
     "...\n\n"
@@ -37,21 +42,29 @@ STATUS_LIST = [
     "you were everything."
 ]
 
-VERIFY_STAFF_ROLE_NAME = "staff"
-VERIFY_BANNER_URL = "https://i.imgur.com/PwrzJ7z.png"
-
 DEFAULT_VERIFY_MESSAGE = (
-    "**Verificação**\n\n"
-    "A verificação garante a veracidade das postagens.\n"
-    "Verifique-se para ter acesso aos canais desejados.\n\n"
-    "**Como funciona?**\n"
-    "01 Você terá que mostrar seu rosto para um admin/staff;\n"
-    "02 Ninguém terá acesso às provas da sua verificação.\n\n"
-    "**Escolha alguma das pessoas abaixo:**\n"
+    "## **__Verificação de rosto__**\n\n"
+    "**Este processo existe para manter o servidor seguro e evitar perfis fake, catfish e postagens enganosas.**\n\n"
+    "> **Seu chat será privado.**\n"
+    "> **Somente você, a staff e o bot terão acesso.**\n"
+    "> **Nada será vazado.**\n"
+    "> **Se não for aprovado, você não receberá acesso.**\n\n"
+    "### **Como funciona**\n"
+    "**1.** Clique em **Iniciar verificação**\n"
+    "**2.** Escolha um membro da staff disponível\n"
+    "**3.** Um chat privado será aberto\n"
+    "**4.** Envie uma foto do seu rosto no ticket\n"
+    "**5.** Aguarde aprovação manual\n\n"
+    "### **Staff disponível**\n"
     "{staff_list}\n\n"
-    "Este canal é exclusivo para fotos do seu próprio rosto.\n"
-    "Evite postar imagens de terceiros e conteúdo enganoso.\n"
-    "O descumprimento pode resultar em remoção da verificação."
+    "**Ao iniciar, você concorda em enviar apenas fotos suas.**\n"
+    "**Fotos falsas, roubadas ou de terceiros resultam em recusa imediata.**"
+)
+
+DEFAULT_REJECT_MESSAGE = (
+    "{user}, sua verificação **não foi aprovada**.\n\n"
+    "Se quiser tentar novamente, fale com a staff e envie uma nova verificação real.\n"
+    "**Perfis fake, fotos de terceiros ou conteúdo enganoso não são aceitos.**"
 )
 
 # =========================================================
@@ -90,6 +103,14 @@ def init_db():
                 PRIMARY KEY (guild_id, age_key)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS verify_cooldowns (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                last_opened_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
 
         existing_cols = {
             row["name"]
@@ -100,6 +121,9 @@ def init_db():
             "verify_category_id": "ALTER TABLE guild_config ADD COLUMN verify_category_id INTEGER",
             "verify_role_id": "ALTER TABLE guild_config ADD COLUMN verify_role_id INTEGER",
             "verify_message": "ALTER TABLE guild_config ADD COLUMN verify_message TEXT",
+            "verify_log_channel_id": "ALTER TABLE guild_config ADD COLUMN verify_log_channel_id INTEGER",
+            "reject_message": "ALTER TABLE guild_config ADD COLUMN reject_message TEXT",
+            "ticket_panel_channel_id": "ALTER TABLE guild_config ADD COLUMN ticket_panel_channel_id INTEGER",
         }
 
         for col_name, sql in migrations.items():
@@ -116,7 +140,12 @@ def ensure_guild_row(guild_id: int):
             for row in conn.execute("PRAGMA table_info(guild_config)").fetchall()
         }
 
-        if {"verify_category_id", "verify_role_id", "verify_message"}.issubset(columns):
+        advanced_columns = {
+            "verify_category_id", "verify_role_id", "verify_message",
+            "verify_log_channel_id", "reject_message", "ticket_panel_channel_id"
+        }
+
+        if advanced_columns.issubset(columns):
             conn.execute("""
                 INSERT OR IGNORE INTO guild_config (
                     guild_id,
@@ -128,10 +157,13 @@ def ensure_guild_row(guild_id: int):
                     welcome_gif,
                     verify_category_id,
                     verify_role_id,
-                    verify_message
+                    verify_message,
+                    verify_log_channel_id,
+                    reject_message,
+                    ticket_panel_channel_id
                 )
-                VALUES (?, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?)
-            """, (guild_id, DEFAULT_WELCOME_MESSAGE, DEFAULT_VERIFY_MESSAGE))
+                VALUES (?, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, NULL, ?, NULL)
+            """, (guild_id, DEFAULT_WELCOME_MESSAGE, DEFAULT_VERIFY_MESSAGE, DEFAULT_REJECT_MESSAGE))
         else:
             conn.execute("""
                 INSERT OR IGNORE INTO guild_config (
@@ -151,10 +183,7 @@ def ensure_guild_row(guild_id: int):
 def get_guild_config(guild_id: int) -> dict:
     ensure_guild_row(guild_id)
     with get_conn() as conn:
-        row = conn.execute("""
-            SELECT * FROM guild_config
-            WHERE guild_id = ?
-        """, (guild_id,)).fetchone()
+        row = conn.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,)).fetchone()
         return dict(row) if row else {}
 
 def set_guild_config(guild_id: int, **kwargs):
@@ -170,6 +199,9 @@ def set_guild_config(guild_id: int, **kwargs):
         "verify_category_id",
         "verify_role_id",
         "verify_message",
+        "verify_log_channel_id",
+        "reject_message",
+        "ticket_panel_channel_id",
     }
 
     fields = []
@@ -186,10 +218,7 @@ def set_guild_config(guild_id: int, **kwargs):
     values.append(guild_id)
 
     with get_conn() as conn:
-        conn.execute(
-            f"UPDATE guild_config SET {', '.join(fields)} WHERE guild_id = ?",
-            values
-        )
+        conn.execute(f"UPDATE guild_config SET {', '.join(fields)} WHERE guild_id = ?", values)
         conn.commit()
 
 def set_age_role(guild_id: int, age_key: str, role_id: int):
@@ -204,12 +233,33 @@ def set_age_role(guild_id: int, age_key: str, role_id: int):
 
 def get_age_roles(guild_id: int) -> dict:
     with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT age_key, role_id
-            FROM age_roles
-            WHERE guild_id = ?
-        """, (guild_id,)).fetchall()
+        rows = conn.execute("SELECT age_key, role_id FROM age_roles WHERE guild_id = ?", (guild_id,)).fetchall()
         return {row["age_key"]: row["role_id"] for row in rows}
+
+def set_verify_cooldown(guild_id: int, user_id: int):
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO verify_cooldowns (guild_id, user_id, last_opened_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id)
+            DO UPDATE SET last_opened_at = excluded.last_opened_at
+        """, (guild_id, user_id, now_ts))
+        conn.commit()
+
+def get_verify_cooldown_remaining(guild_id: int, user_id: int) -> int:
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT last_opened_at FROM verify_cooldowns
+            WHERE guild_id = ? AND user_id = ?
+        """, (guild_id, user_id)).fetchone()
+
+    if not row:
+        return 0
+
+    elapsed = int(datetime.now(timezone.utc).timestamp()) - int(row["last_opened_at"])
+    remaining = TICKET_COOLDOWN_SECONDS - elapsed
+    return max(0, remaining)
 
 # =========================================================
 # HELPERS
@@ -269,7 +319,6 @@ def clean_url(url: Optional[str]) -> Optional[str]:
         return None
 
     url = url.strip()
-
     if (url.startswith('"') and url.endswith('"')) or (url.startswith("'") and url.endswith("'")):
         url = url[1:-1].strip()
 
@@ -293,20 +342,12 @@ def is_valid_image_url(url: Optional[str]) -> bool:
     except Exception:
         return False
 
-    if parsed.scheme not in ("http", "https"):
-        return False
-
-    if not parsed.netloc:
-        return False
-
-    return True
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 def has_allowed_image_extension(url: Optional[str]) -> bool:
     if not url:
         return False
-
-    lowered = url.lower()
-    return lowered.endswith((".gif", ".png", ".jpg", ".jpeg", ".webp"))
+    return url.lower().endswith((".gif", ".png", ".jpg", ".jpeg", ".webp"))
 
 def build_age_embed(guild: discord.Guild) -> discord.Embed:
     e_menos13 = get_emoji_by_name(guild, "menos13")
@@ -338,33 +379,18 @@ def build_age_embed(guild: discord.Guild) -> discord.Embed:
     return embed
 
 def find_staff_role(guild: discord.Guild) -> Optional[discord.Role]:
-    return discord.utils.find(
-        lambda r: r.name.lower() == VERIFY_STAFF_ROLE_NAME.lower(),
-        guild.roles
-    )
+    return discord.utils.find(lambda r: r.name.lower() == VERIFY_STAFF_ROLE_NAME.lower(), guild.roles)
 
 def get_staff_members(guild: discord.Guild) -> list[discord.Member]:
     staff_role = find_staff_role(guild)
     if not staff_role:
         return []
-
-    return [
-        member for member in guild.members
-        if not member.bot and staff_role in member.roles
-    ]
+    return [member for member in guild.members if not member.bot and staff_role in member.roles]
 
 def format_verify_message(template: str, guild: discord.Guild) -> str:
     staff_members = get_staff_members(guild)
-    if staff_members:
-        staff_list = " | ".join(member.mention for member in staff_members)
-    else:
-        staff_list = "`nenhum staff configurado`"
-
-    return (
-        template
-        .replace("{server}", guild.name)
-        .replace("{staff_list}", staff_list)
-    )
+    staff_list = " | ".join(member.mention for member in staff_members) if staff_members else "`nenhum staff configurado`"
+    return template.replace("{server}", guild.name).replace("{staff_list}", staff_list)
 
 def sanitize_channel_name(name: str) -> str:
     name = name.lower()
@@ -372,24 +398,41 @@ def sanitize_channel_name(name: str) -> str:
     name = re.sub(r"-{2,}", "-", name).strip("-")
     return name or "usuario"
 
-def find_existing_verify_channel(guild: discord.Guild, user_id: int) -> Optional[discord.TextChannel]:
-    for channel in guild.text_channels:
-        if channel.topic == f"verify_user:{user_id}":
-            return channel
-    return None
-
 def get_ticket_user_id(channel: discord.TextChannel) -> Optional[int]:
     if not channel.topic:
         return None
-
     match = re.fullmatch(r"verify_user:(\d+)", channel.topic.strip())
     if not match:
         return None
-
     try:
         return int(match.group(1))
     except Exception:
         return None
+
+def get_open_verify_channels_for_user(guild: discord.Guild, user_id: int) -> list[discord.TextChannel]:
+    return [
+        channel for channel in guild.text_channels
+        if channel.topic == f"verify_user:{user_id}"
+    ]
+
+async def send_verify_log(guild: discord.Guild, title: str, description: str):
+    cfg = get_guild_config(guild.id)
+    log_channel = await get_text_channel(guild, cfg.get("verify_log_channel_id"))
+    if not log_channel:
+        return
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.from_rgb(20, 20, 20),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text=guild.name)
+
+    try:
+        await log_channel.send(embed=embed)
+    except Exception:
+        pass
 
 # =========================================================
 # BOT
@@ -422,10 +465,7 @@ status_cycle = itertools.cycle(STATUS_LIST)
 async def change_status():
     await bot.change_presence(
         status=discord.Status.online,
-        activity=discord.Activity(
-            type=discord.ActivityType.playing,
-            name=next(status_cycle)
-        )
+        activity=discord.Activity(type=discord.ActivityType.playing, name=next(status_cycle))
     )
 
 # =========================================================
@@ -441,28 +481,19 @@ class AgeView(discord.ui.View):
         member = interaction.user
 
         if guild is None or not isinstance(member, discord.Member):
-            await interaction.response.send_message(
-                "Isso só funciona dentro de servidor.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("Isso só funciona dentro de servidor.", ephemeral=True)
             return
 
         age_roles = get_age_roles(guild.id)
         target_role_id = age_roles.get(age_key)
 
         if not target_role_id:
-            await interaction.response.send_message(
-                "O sistema de idade ainda não foi configurado nesse servidor.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("O sistema de idade ainda não foi configurado nesse servidor.", ephemeral=True)
             return
 
         target_role = guild.get_role(target_role_id)
         if not target_role:
-            await interaction.response.send_message(
-                "O cargo configurado não foi encontrado.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("O cargo configurado não foi encontrado.", ephemeral=True)
             return
 
         try:
@@ -486,15 +517,9 @@ class AgeView(discord.ui.View):
             )
 
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "Não consegui mexer nos cargos. Deixa meu cargo acima dos cargos de idade.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("Não consegui mexer nos cargos. Deixa meu cargo acima dos cargos de idade.", ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(
-                f"Deu erro: `{e}`",
-                ephemeral=True
-            )
+            await interaction.response.send_message(f"Deu erro: `{e}`", ephemeral=True)
 
     @discord.ui.button(label="-13", style=discord.ButtonStyle.secondary, custom_id="age_menos13", row=0)
     async def menos13(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -514,14 +539,12 @@ class AgeView(discord.ui.View):
 
 def build_age_view_for_guild(guild: discord.Guild) -> AgeView:
     view = AgeView()
-
     emoji_map = {
         "age_menos13": "menos13",
         "age_mais13": "mais13",
         "age_mais18": "mais18",
         "age_mais21": "mais21",
     }
-
     for item in view.children:
         if isinstance(item, discord.ui.Button):
             emoji_name = emoji_map.get(item.custom_id)
@@ -529,7 +552,6 @@ def build_age_view_for_guild(guild: discord.Guild) -> AgeView:
                 emoji = get_emoji_by_name(guild, emoji_name)
                 if emoji:
                     item.emoji = emoji
-
     return view
 
 # =========================================================
@@ -544,11 +566,7 @@ class TicketActionView(discord.ui.View):
         staff_role = find_staff_role(guild)
         return bool(user.guild_permissions.administrator or (staff_role and staff_role in user.roles))
 
-    @discord.ui.button(
-        label="Aprovar",
-        style=discord.ButtonStyle.success,
-        custom_id="verify_approve_ticket"
-    )
+    @discord.ui.button(label="Aprovar", style=discord.ButtonStyle.success, custom_id="verify_approve_ticket")
     async def approve_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         channel = interaction.channel
@@ -576,10 +594,7 @@ class TicketActionView(discord.ui.View):
         verify_role_id = cfg.get("verify_role_id")
 
         if not verify_role_id:
-            await interaction.response.send_message(
-                "cargo de verificação não configurado. usa `/setup_verificacao` primeiro.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("cargo de verificação não configurado. usa `/setup_verificacao` primeiro.", ephemeral=True)
             return
 
         verify_role = guild.get_role(verify_role_id)
@@ -595,19 +610,18 @@ class TicketActionView(discord.ui.View):
                 f"{target_member.mention} foi aprovado e recebeu o cargo {verify_role.mention}.",
                 ephemeral=False
             )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "não consegui dar o cargo. deixa meu cargo acima do cargo de verificação.",
-                ephemeral=True
+
+            await send_verify_log(
+                guild,
+                "Verificação aprovada",
+                f"**Usuário:** {target_member.mention}\n**Staff:** {actor.mention}\n**Canal:** {channel.mention}"
             )
+        except discord.Forbidden:
+            await interaction.response.send_message("não consegui dar o cargo. deixa meu cargo acima do cargo de verificação.", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"deu erro ao aprovar: `{e}`", ephemeral=True)
 
-    @discord.ui.button(
-        label="Recusar",
-        style=discord.ButtonStyle.danger,
-        custom_id="verify_reject_ticket"
-    )
+    @discord.ui.button(label="Recusar", style=discord.ButtonStyle.danger, custom_id="verify_reject_ticket")
     async def reject_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         channel = interaction.channel
@@ -623,18 +637,19 @@ class TicketActionView(discord.ui.View):
 
         target_user_id = get_ticket_user_id(channel)
         target_member = guild.get_member(target_user_id) if target_user_id else None
-        mention = target_member.mention if target_member else "usuário"
+        cfg = get_guild_config(guild.id)
+        reject_message = cfg.get("reject_message") or DEFAULT_REJECT_MESSAGE
+        formatted = reject_message.replace("{user}", target_member.mention if target_member else "usuário")
 
-        await interaction.response.send_message(
-            f"{mention}, sua verificação foi recusada. fale com a staff para tentar novamente.",
-            ephemeral=False
+        await interaction.response.send_message(formatted, ephemeral=False)
+
+        await send_verify_log(
+            guild,
+            "Verificação recusada",
+            f"**Usuário:** {(target_member.mention if target_member else 'não encontrado')}\n**Staff:** {actor.mention}\n**Canal:** {channel.mention}"
         )
 
-    @discord.ui.button(
-        label="Fechar ticket",
-        style=discord.ButtonStyle.secondary,
-        custom_id="verify_close_ticket"
-    )
+    @discord.ui.button(label="Fechar ticket", style=discord.ButtonStyle.secondary, custom_id="verify_close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         channel = interaction.channel
@@ -655,13 +670,17 @@ class TicketActionView(discord.ui.View):
             allowed = True
 
         if not allowed:
-            await interaction.response.send_message(
-                "só staff, admin, ou quem abriu pode fechar esse ticket.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("só staff, admin, ou quem abriu pode fechar esse ticket.", ephemeral=True)
             return
 
         await interaction.response.send_message("fechando em 2 segundos...")
+
+        await send_verify_log(
+            guild,
+            "Ticket fechado",
+            f"**Fechado por:** {user.mention}\n**Canal:** {channel.name}"
+        )
+
         await asyncio.sleep(2)
         await channel.delete()
 
@@ -671,7 +690,6 @@ class StaffSelect(discord.ui.Select):
         self.requester = requester
 
         staff_members = get_staff_members(guild)
-
         options = [
             discord.SelectOption(
                 label=member.display_name[:100],
@@ -700,65 +718,42 @@ class StaffSelect(discord.ui.Select):
             await interaction.response.send_message("esse menu não é seu.", ephemeral=True)
             return
 
-        existing = find_existing_verify_channel(guild, user.id)
-        if existing:
+        user_channels = get_open_verify_channels_for_user(guild, user.id)
+        if len(user_channels) >= MAX_VERIFY_TICKETS_PER_USER:
             await interaction.response.send_message(
-                f"você já tem um ticket aberto: {existing.mention}",
+                f"você já tem um ticket aberto: {user_channels[0].mention}",
+                ephemeral=True
+            )
+            return
+
+        remaining = get_verify_cooldown_remaining(guild.id, user.id)
+        if remaining > 0:
+            await interaction.response.send_message(
+                f"calma. espera **{remaining}s** antes de abrir outro ticket.",
                 ephemeral=True
             )
             return
 
         staff_id = int(self.values[0])
         staff_member = guild.get_member(staff_id)
-
         if not staff_member:
-            await interaction.response.send_message(
-                "não encontrei esse staff. tenta de novo.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("não encontrei esse staff. tenta de novo.", ephemeral=True)
             return
 
         cfg = get_guild_config(guild.id)
         category = await get_category_channel(guild, cfg.get("verify_category_id"))
-
         channel_name = f"verify-{sanitize_channel_name(user.name)}-{str(user.id)[-4:]}"
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True
-            ),
-            staff_member: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True
-            ),
-            guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_channels=True,
-                manage_messages=True,
-                attach_files=True,
-                embed_links=True
-            ),
+            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+            staff_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True, attach_files=True, embed_links=True),
         }
 
         staff_role = find_staff_role(guild)
         if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True
-            )
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
 
         try:
             created_channel = await guild.create_text_channel(
@@ -768,24 +763,21 @@ class StaffSelect(discord.ui.Select):
                 category=category
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "não consegui criar o canal. vê se eu tenho permissão de gerenciar canais.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("não consegui criar o canal. vê se eu tenho permissão de gerenciar canais.", ephemeral=True)
             return
         except Exception as e:
-            await interaction.response.send_message(
-                f"deu erro ao criar o canal: `{e}`",
-                ephemeral=True
-            )
+            await interaction.response.send_message(f"deu erro ao criar o canal: `{e}`", ephemeral=True)
             return
+
+        set_verify_cooldown(guild.id, user.id)
 
         embed = discord.Embed(
             title="verificação iniciada",
             description=(
                 f"{user.mention}, envie sua verificação aqui.\n\n"
-                f"verificador escolhido: {staff_member.mention}\n\n"
-                "aguarde a análise da staff."
+                f"**verificador escolhido:** {staff_member.mention}\n\n"
+                "**Este canal é privado e seguro.**\n"
+                "Somente você e a staff conseguem ver isso."
             ),
             color=discord.Color.from_rgb(0, 0, 0)
         )
@@ -797,10 +789,13 @@ class StaffSelect(discord.ui.Select):
             view=TicketActionView()
         )
 
-        await interaction.response.send_message(
-            f"ticket criado em {created_channel.mention}",
-            ephemeral=True
+        await send_verify_log(
+            guild,
+            "Ticket de verificação criado",
+            f"**Usuário:** {user.mention}\n**Staff escolhida:** {staff_member.mention}\n**Canal:** {created_channel.mention}"
         )
+
+        await interaction.response.send_message(f"ticket criado em {created_channel.mention}", ephemeral=True)
 
 class StaffPickerView(discord.ui.View):
     def __init__(self, guild: discord.Guild, requester: discord.Member):
@@ -811,44 +806,27 @@ class StartVerifyPersistentView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="Iniciar verificação",
-        style=discord.ButtonStyle.secondary,
-        custom_id="verify_start_button"
-    )
+    @discord.ui.button(label="Iniciar verificação", style=discord.ButtonStyle.secondary, custom_id="verify_start_button")
     async def start_verify(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         user = interaction.user
 
         if guild is None or not isinstance(user, discord.Member):
-            await interaction.response.send_message(
-                "isso só funciona dentro do servidor.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("isso só funciona dentro do servidor.", ephemeral=True)
             return
 
-        existing = find_existing_verify_channel(guild, user.id)
-        if existing:
-            await interaction.response.send_message(
-                f"você já tem um ticket aberto: {existing.mention}",
-                ephemeral=True
-            )
+        user_channels = get_open_verify_channels_for_user(guild, user.id)
+        if len(user_channels) >= MAX_VERIFY_TICKETS_PER_USER:
+            await interaction.response.send_message(f"você já tem um ticket aberto: {user_channels[0].mention}", ephemeral=True)
             return
 
         staff_members = get_staff_members(guild)
         if not staff_members:
-            await interaction.response.send_message(
-                f"não achei ninguém com o cargo `{VERIFY_STAFF_ROLE_NAME}`.",
-                ephemeral=True
-            )
+            await interaction.response.send_message(f"não achei ninguém com o cargo `{VERIFY_STAFF_ROLE_NAME}`.", ephemeral=True)
             return
 
         view = StaffPickerView(guild, user)
-        await interaction.response.send_message(
-            "escolha abaixo com quem você quer verificar:",
-            view=view,
-            ephemeral=True
-        )
+        await interaction.response.send_message("escolha abaixo com quem você quer verificar:", view=view, ephemeral=True)
 
 # =========================================================
 # EVENTS
@@ -890,25 +868,19 @@ async def on_member_join(member: discord.Member):
 
     text = format_welcome_text(welcome_message, member)
 
-    embed = discord.Embed(
-        description=text,
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
+    embed = discord.Embed(description=text, color=discord.Color.from_rgb(0, 0, 0))
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=member.guild.name)
 
     gif_url = clean_url(welcome_gif)
-
     if gif_url and is_valid_image_url(gif_url) and has_allowed_image_extension(gif_url):
         embed.set_image(url=gif_url)
 
     try:
         await asyncio.sleep(1.2)
         await channel.send(embed=embed)
-
     except discord.HTTPException as e:
         print(f"Erro ao enviar embed de boas-vindas em {member.guild.name}: {e}")
-
         try:
             if gif_url and is_valid_image_url(gif_url):
                 await channel.send(content=f"{text}\n{gif_url}")
@@ -916,7 +888,6 @@ async def on_member_join(member: discord.Member):
                 await channel.send(content=text)
         except Exception as e2:
             print(f"Erro no fallback de boas-vindas em {member.guild.name}: {e2}")
-
     except Exception as e:
         print(f"Erro ao enviar boas-vindas em {member.guild.name}: {e}")
 
@@ -930,25 +901,13 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="setup_boasvindas", description="Define o canal e o cargo automático")
 @app_commands.check(admin_only)
-@app_commands.describe(
-    canal="Canal onde a mensagem de boas-vindas será enviada",
-    cargo_membro="Cargo automático ao entrar"
-)
-async def setup_boasvindas(
-    interaction: discord.Interaction,
-    canal: discord.TextChannel,
-    cargo_membro: discord.Role
-):
+@app_commands.describe(canal="Canal onde a mensagem de boas-vindas será enviada", cargo_membro="Cargo automático ao entrar")
+async def setup_boasvindas(interaction: discord.Interaction, canal: discord.TextChannel, cargo_membro: discord.Role):
     if interaction.guild is None:
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
         return
 
-    set_guild_config(
-        interaction.guild.id,
-        welcome_channel_id=canal.id,
-        member_role_id=cargo_membro.id
-    )
-
+    set_guild_config(interaction.guild.id, welcome_channel_id=canal.id, member_role_id=cargo_membro.id)
     await interaction.response.send_message(
         f"configuração salva.\n\ncanal: {canal.mention}\ncargo automático: {cargo_membro.mention}",
         ephemeral=True
@@ -956,41 +915,22 @@ async def setup_boasvindas(
 
 @bot.tree.command(name="mensagem_boasvindas", description="Define o texto e gif da mensagem de boas-vindas")
 @app_commands.check(admin_only)
-@app_commands.describe(
-    mensagem="Usa {user}, {username}, {server}, {members}",
-    gif="Link direto do gif/imagem (opcional)"
-)
-async def mensagem_boasvindas(
-    interaction: discord.Interaction,
-    mensagem: str,
-    gif: Optional[str] = None
-):
+@app_commands.describe(mensagem="Usa {user}, {username}, {server}, {members}", gif="Link direto do gif/imagem (opcional)")
+async def mensagem_boasvindas(interaction: discord.Interaction, mensagem: str, gif: Optional[str] = None):
     if interaction.guild is None:
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
         return
 
     gif = clean_url(gif)
-
     if gif:
         if not is_valid_image_url(gif):
-            await interaction.response.send_message(
-                "esse link parece inválido. manda um link direto começando com https://",
-                ephemeral=True
-            )
+            await interaction.response.send_message("esse link parece inválido. manda um link direto começando com https://", ephemeral=True)
             return
-
         if not has_allowed_image_extension(gif):
-            await interaction.response.send_message(
-                "manda um link direto que termine em .gif, .png, .jpg, .jpeg ou .webp",
-                ephemeral=True
-            )
+            await interaction.response.send_message("manda um link direto que termine em .gif, .png, .jpg, .jpeg ou .webp", ephemeral=True)
             return
 
-    set_guild_config(
-        interaction.guild.id,
-        welcome_message=mensagem,
-        welcome_gif=gif
-    )
+    set_guild_config(interaction.guild.id, welcome_message=mensagem, welcome_gif=gif)
 
     preview = (
         mensagem
@@ -1001,10 +941,7 @@ async def mensagem_boasvindas(
     )
 
     extra = f"\n\ngif salvo: `{gif}`" if gif else "\n\nsem gif."
-    await interaction.response.send_message(
-        f"mensagem de boas-vindas salva.\n\nprévia:\n{preview}{extra}",
-        ephemeral=True
-    )
+    await interaction.response.send_message(f"mensagem de boas-vindas salva.\n\nprévia:\n{preview}{extra}", ephemeral=True)
 
 @bot.tree.command(name="limpar_gif_boasvindas", description="Remove o gif salvo da mensagem de boas-vindas")
 @app_commands.check(admin_only)
@@ -1012,12 +949,8 @@ async def limpar_gif_boasvindas(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
         return
-
     set_guild_config(interaction.guild.id, welcome_gif=None)
-    await interaction.response.send_message(
-        "gif das boas-vindas removido.",
-        ephemeral=True
-    )
+    await interaction.response.send_message("gif das boas-vindas removido.", ephemeral=True)
 
 @bot.tree.command(name="preview_boasvindas", description="Mostra uma prévia da mensagem de boas-vindas")
 @app_commands.check(admin_only)
@@ -1029,13 +962,9 @@ async def preview_boasvindas(interaction: discord.Interaction):
     cfg = get_guild_config(interaction.guild.id)
     welcome_message = cfg.get("welcome_message") or DEFAULT_WELCOME_MESSAGE
     welcome_gif = clean_url(cfg.get("welcome_gif"))
-
     text = format_welcome_text(welcome_message, interaction.user)
 
-    embed = discord.Embed(
-        description=text,
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
+    embed = discord.Embed(description=text, color=discord.Color.from_rgb(0, 0, 0))
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
     embed.set_footer(text=interaction.guild.name)
 
@@ -1053,20 +982,12 @@ async def preview_boasvindas(interaction: discord.Interaction):
     cargo_mais18="Cargo para +18",
     cargo_mais21="Cargo para +21"
 )
-async def setup_idade(
-    interaction: discord.Interaction,
-    canal: discord.TextChannel,
-    cargo_menos13: discord.Role,
-    cargo_mais13: discord.Role,
-    cargo_mais18: discord.Role,
-    cargo_mais21: discord.Role
-):
+async def setup_idade(interaction: discord.Interaction, canal: discord.TextChannel, cargo_menos13: discord.Role, cargo_mais13: discord.Role, cargo_mais18: discord.Role, cargo_mais21: discord.Role):
     if interaction.guild is None:
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
         return
 
     guild_id = interaction.guild.id
-
     set_guild_config(guild_id, age_channel_id=canal.id)
     set_age_role(guild_id, "menos13", cargo_menos13.id)
     set_age_role(guild_id, "mais13", cargo_mais13.id)
@@ -1096,44 +1017,30 @@ async def postar_idade(interaction: discord.Interaction):
 
     cfg = get_guild_config(interaction.guild.id)
     channel_id = cfg.get("age_channel_id")
-
     if not channel_id:
-        await interaction.response.send_message(
-            "configura primeiro com `/setup_idade`.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("configura primeiro com `/setup_idade`.", ephemeral=True)
         return
 
     channel = await get_text_channel(interaction.guild, channel_id)
     if not channel:
-        await interaction.response.send_message(
-            "não consegui acessar o canal configurado.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("não consegui acessar o canal configurado.", ephemeral=True)
         return
 
     embed = build_age_embed(interaction.guild)
     view = build_age_view_for_guild(interaction.guild)
-
     msg = await channel.send(embed=embed, view=view)
     set_guild_config(interaction.guild.id, age_message_id=msg.id)
 
-    await interaction.response.send_message(
-        f"mensagem de idade enviada em {channel.mention}.",
-        ephemeral=True
-    )
+    await interaction.response.send_message(f"mensagem de idade enviada em {channel.mention}.", ephemeral=True)
 
-@bot.tree.command(name="setup_verificacao", description="Configura a categoria e o cargo da verificação")
+@bot.tree.command(name="setup_verificacao", description="Configura categoria, cargo e canal de logs da verificação")
 @app_commands.check(admin_only)
 @app_commands.describe(
     categoria="Categoria onde os tickets de verificação vão abrir",
-    cargo_aprovado="Cargo que a pessoa recebe ao ser aprovada"
+    cargo_aprovado="Cargo que a pessoa recebe ao ser aprovada",
+    canal_logs="Canal onde o bot envia logs da verificação"
 )
-async def setup_verificacao(
-    interaction: discord.Interaction,
-    categoria: discord.CategoryChannel,
-    cargo_aprovado: discord.Role
-):
+async def setup_verificacao(interaction: discord.Interaction, categoria: discord.CategoryChannel, cargo_aprovado: discord.Role, canal_logs: discord.TextChannel):
     if interaction.guild is None:
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
         return
@@ -1141,40 +1048,48 @@ async def setup_verificacao(
     set_guild_config(
         interaction.guild.id,
         verify_category_id=categoria.id,
-        verify_role_id=cargo_aprovado.id
+        verify_role_id=cargo_aprovado.id,
+        verify_log_channel_id=canal_logs.id
     )
 
     await interaction.response.send_message(
         (
             "configuração de verificação salva.\n\n"
             f"categoria: {categoria.name}\n"
-            f"cargo ao aprovar: {cargo_aprovado.mention}"
+            f"cargo ao aprovar: {cargo_aprovado.mention}\n"
+            f"canal de logs: {canal_logs.mention}"
         ),
         ephemeral=True
     )
 
 @bot.tree.command(name="mensagem_verificacao", description="Define o texto do painel de verificação")
 @app_commands.check(admin_only)
-@app_commands.describe(
-    mensagem="Você pode usar {server} e {staff_list}"
-)
+@app_commands.describe(mensagem="Você pode usar {server} e {staff_list}")
 async def mensagem_verificacao(interaction: discord.Interaction, mensagem: str):
     if interaction.guild is None:
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
         return
 
     set_guild_config(interaction.guild.id, verify_message=mensagem)
-
     preview = format_verify_message(mensagem, interaction.guild)
-    await interaction.response.send_message(
-        f"mensagem de verificação salva.\n\nprévia:\n{preview}",
-        ephemeral=True
-    )
+    await interaction.response.send_message(f"mensagem de verificação salva.\n\nprévia:\n{preview}", ephemeral=True)
+
+@bot.tree.command(name="mensagem_recusa", description="Define a mensagem enviada quando alguém for recusado")
+@app_commands.check(admin_only)
+@app_commands.describe(mensagem="Use {user} para mencionar a pessoa recusada")
+async def mensagem_recusa(interaction: discord.Interaction, mensagem: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
+        return
+
+    set_guild_config(interaction.guild.id, reject_message=mensagem)
+    preview = mensagem.replace("{user}", interaction.user.mention)
+    await interaction.response.send_message(f"mensagem de recusa salva.\n\nprévia:\n{preview}", ephemeral=True)
 
 @bot.tree.command(name="postar_verificacao", description="Posta o painel de verificação")
 @app_commands.check(admin_only)
 async def postar_verificacao(interaction: discord.Interaction):
-    if interaction.guild is None:
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
         await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
         return
 
@@ -1183,10 +1098,7 @@ async def postar_verificacao(interaction: discord.Interaction):
 
     staff_members = get_staff_members(interaction.guild)
     if not staff_members:
-        await interaction.response.send_message(
-            f"não achei ninguém com o cargo `{VERIFY_STAFF_ROLE_NAME}`.",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"não achei ninguém com o cargo `{VERIFY_STAFF_ROLE_NAME}`.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -1196,8 +1108,8 @@ async def postar_verificacao(interaction: discord.Interaction):
     embed.set_image(url=VERIFY_BANNER_URL)
 
     view = StartVerifyPersistentView()
-
     await interaction.channel.send(embed=embed, view=view)
+    set_guild_config(interaction.guild.id, ticket_panel_channel_id=interaction.channel.id)
     await interaction.response.send_message("painel de verificação enviado.", ephemeral=True)
 
 @bot.tree.command(name="config", description="Mostra a configuração atual do servidor")
@@ -1215,7 +1127,7 @@ async def config(interaction: discord.Interaction):
         if not channel_id:
             return "`não definido`"
         channel = guild.get_channel(channel_id)
-        return channel.mention if channel else f"`{channel_id}`"
+        return channel.mention if isinstance(channel, discord.TextChannel) else f"`{channel_id}`"
 
     def fmt_role(role_id):
         if not role_id:
@@ -1229,10 +1141,7 @@ async def config(interaction: discord.Interaction):
         category = guild.get_channel(category_id)
         return category.name if isinstance(category, discord.CategoryChannel) else f"`{category_id}`"
 
-    emoji_checks = []
-    for name in AGE_EMOJI_NAMES:
-        emoji_checks.append(f"{name}: {'✅' if get_emoji_by_name(guild, name) else '❌'}")
-
+    emoji_checks = [f"{name}: {'✅' if get_emoji_by_name(guild, name) else '❌'}" for name in AGE_EMOJI_NAMES]
     welcome_gif = clean_url(cfg.get("welcome_gif")) or "não definido"
     staff_role = find_staff_role(guild)
 
@@ -1244,7 +1153,9 @@ async def config(interaction: discord.Interaction):
         f"**gif boas-vindas:** `{welcome_gif}`\n"
         f"**cargo staff verificação:** {staff_role.mention if staff_role else '`não encontrado`'}\n"
         f"**categoria verificação:** {fmt_category(cfg.get('verify_category_id'))}\n"
-        f"**cargo ao aprovar:** {fmt_role(cfg.get('verify_role_id'))}\n\n"
+        f"**cargo ao aprovar:** {fmt_role(cfg.get('verify_role_id'))}\n"
+        f"**canal logs verificação:** {fmt_channel(cfg.get('verify_log_channel_id'))}\n"
+        f"**canal painel verificação:** {fmt_channel(cfg.get('ticket_panel_channel_id'))}\n\n"
         f"**-13:** {fmt_role(age_roles.get('menos13'))}\n"
         f"**+13:** {fmt_role(age_roles.get('mais13'))}\n"
         f"**+18:** {fmt_role(age_roles.get('mais18'))}\n"
@@ -1264,6 +1175,25 @@ async def reset_idade(interaction: discord.Interaction):
     set_guild_config(interaction.guild.id, age_message_id=None)
     await interaction.response.send_message("id da mensagem de idade resetado.", ephemeral=True)
 
+@bot.tree.command(name="reset_verificacao", description="Reseta a configuração da verificação")
+@app_commands.check(admin_only)
+async def reset_verificacao(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Usa isso dentro de um servidor.", ephemeral=True)
+        return
+
+    set_guild_config(
+        interaction.guild.id,
+        verify_category_id=None,
+        verify_role_id=None,
+        verify_log_channel_id=None,
+        ticket_panel_channel_id=None,
+        verify_message=DEFAULT_VERIFY_MESSAGE,
+        reject_message=DEFAULT_REJECT_MESSAGE,
+    )
+
+    await interaction.response.send_message("configuração de verificação resetada.", ephemeral=True)
+
 # =========================================================
 # ERROS
 # =========================================================
@@ -1276,33 +1206,23 @@ async def reset_idade(interaction: discord.Interaction):
 @postar_idade.error
 @setup_verificacao.error
 @mensagem_verificacao.error
+@mensagem_recusa.error
 @postar_verificacao.error
 @config.error
 @reset_idade.error
+@reset_verificacao.error
 async def admin_command_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.errors.CheckFailure):
         if interaction.response.is_done():
-            await interaction.followup.send(
-                "tu precisa ser administrador pra usar isso.",
-                ephemeral=True
-            )
+            await interaction.followup.send("tu precisa ser administrador pra usar isso.", ephemeral=True)
         else:
-            await interaction.response.send_message(
-                "tu precisa ser administrador pra usar isso.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("tu precisa ser administrador pra usar isso.", ephemeral=True)
         return
 
     if interaction.response.is_done():
-        await interaction.followup.send(
-            f"deu erro: `{error}`",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"deu erro: `{error}`", ephemeral=True)
     else:
-        await interaction.response.send_message(
-            f"deu erro: `{error}`",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"deu erro: `{error}`", ephemeral=True)
 
 # =========================================================
 # RUN
