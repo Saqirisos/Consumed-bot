@@ -1132,8 +1132,6 @@ pra manter o servidor seguro e evitar fakes, é necessário concluir sua verific
     embed = discord.Embed(
         description=mensagem,
         color=discord.Color.from_rgb(0, 0, 0)
-    ),
-        color=discord.Color.from_rgb(0, 0, 0)
     )
     embed.set_image(url=VERIFY_BANNER_URL)
 
