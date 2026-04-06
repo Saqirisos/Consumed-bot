@@ -453,8 +453,48 @@ def build_reject_embed(target_member: Optional[discord.Member]) -> discord.Embed
         ),
         color=discord.Color.red(),
     )
+    embed.set_footer(text="consumed verification")
     return embed
 
+def build_approve_embed(target_member: Optional[discord.Member], verify_role: Optional[discord.Role], actor: Optional[discord.Member] = None) -> discord.Embed:
+    mention = target_member.mention if target_member else "usuário"
+    role_text = verify_role.mention if verify_role else "`cargo não encontrado`"
+    actor_text = actor.mention if actor else "staff"
+
+    embed = discord.Embed(
+        title="✦ verificação aprovada",
+        description=(
+            f"{mention}, sua verificação foi concluída.\n\n"
+            "**status**\n"
+            f"• aprovado por {actor_text}\n\n"
+            "**cargo recebido**\n"
+            f"> {role_text}\n\n"
+            "agora você tem acesso completo ao servidor."
+        ),
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text="consumed verification")
+    return embed
+
+def build_ticket_started_embed(user: discord.Member, staff_member: discord.Member, guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="✦ verificação iniciada",
+        description=(
+            f"{user.mention}, sua verificação começou.\n\n"
+            "**staff responsável**\n"
+            f"> {staff_member.mention}\n\n"
+            "**instruções**\n"
+            "• envie uma foto do seu rosto em tempo real\n"
+            "• evite filtros ou baixa qualidade\n"
+            "• aguarde análise da staff\n\n"
+            "**segurança**\n"
+            "este canal é privado.\n"
+            "apenas você e a staff têm acesso."
+        ),
+        color=discord.Color.from_rgb(0, 0, 0),
+    )
+    embed.set_footer(text=guild.name)
+    return embed
 
 def find_staff_role(guild: discord.Guild) -> Optional[discord.Role]:
     return discord.utils.find(
@@ -701,10 +741,8 @@ class TicketActionView(discord.ui.View):
             if verify_role not in target_member.roles:
                 await target_member.add_roles(verify_role)
 
-            await interaction.response.send_message(
-                f"{target_member.mention} foi aprovado e recebeu o cargo {verify_role.mention}.",
-                ephemeral=False,
-            )
+            embed = build_approve_embed(target_member, verify_role, actor)
+            await interaction.response.send_message(embed=embed, ephemeral=False)
 
             await send_verify_log(
                 guild,
@@ -839,6 +877,8 @@ class StaffSelect(discord.ui.Select):
             await interaction.response.send_message("não encontrei esse staff. tenta de novo.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         cfg = get_guild_config(guild.id)
         category = await get_category_channel(guild, cfg.get("verify_category_id"))
         channel_name = f"verify-{sanitize_channel_name(user.name)}-{str(user.id)[-4:]}"
@@ -888,13 +928,13 @@ class StaffSelect(discord.ui.Select):
                 category=category,
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "não consegui criar o canal. vê se eu tenho permissão de gerenciar canais.",
                 ephemeral=True,
             )
             return
         except Exception as e:
-            await interaction.response.send_message(f"deu erro ao criar o canal: `{e}`", ephemeral=True)
+            await interaction.followup.send(f"deu erro ao criar o canal: `{e}`", ephemeral=True)
             return
 
         set_verify_cooldown(guild.id, user.id)
@@ -913,7 +953,7 @@ class StaffSelect(discord.ui.Select):
             f"**Usuário:** {user.mention}\n**Staff escolhida:** {staff_member.mention}\n**Canal:** {created_channel.mention}",
         )
 
-        await interaction.response.send_message(f"ticket criado em {created_channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"ticket criado em {created_channel.mention}", ephemeral=True)
 
 class StaffPickerView(discord.ui.View):
     def __init__(self, guild: discord.Guild, requester: discord.Member):
